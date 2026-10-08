@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tracing::warn;
+use tracing::{debug, warn};
 use wayland_protocols_misc::zwp_input_method_v2::server::{
     zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
     zwp_input_method_v2::{self, ZwpInputMethodV2},
@@ -246,6 +246,7 @@ where
                 // v1 bridge: use the v1 client's last serial so it accepts the event.
                 self.text_input_handle
                     .with_active_text_input_v1(|ti, _surface, serial| {
+                        debug!(serial, text = ?text, "ime commit_string -> text-input-v1");
                         ti.commit_string(serial, text.clone());
                     });
             }
@@ -271,6 +272,12 @@ where
                         } else {
                             cursor_end
                         };
+                        debug!(
+                            serial,
+                            text = ?text,
+                            cursor,
+                            "ime preedit -> text-input-v1"
+                        );
                         ti.preedit_cursor(cursor);
                         // Empty commit part: nothing to commit on reset.
                         ti.preedit_string(serial, text.clone(), String::new());

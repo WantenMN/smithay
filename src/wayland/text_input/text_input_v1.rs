@@ -396,6 +396,16 @@ where
 
     text_input_handle.set_active_v1(resource.clone(), surface.clone(), serial);
 
+    debug!(
+        serial,
+        has_ime,
+        is_new_active,
+        has_surrounding = pending.surrounding_text.is_some(),
+        has_content_type = pending.content_type.is_some(),
+        has_cursor_rect = pending.cursor_rectangle.is_some(),
+        "text-input-v1 commit"
+    );
+
     if !has_ime {
         debug!("stashing text-input-v1 state without IME running");
         return;
@@ -407,6 +417,10 @@ where
     }
 
     if let Some((text, cursor, anchor)) = pending.surrounding_text {
+        debug!(
+            len = text.len(),
+            cursor, anchor, "text-input-v1 surrounding_text -> ime"
+        );
         input_method_handle.with_instance(|input_method| {
             input_method.object.surrounding_text(text, cursor, anchor);
         });
@@ -421,6 +435,7 @@ where
     }
 
     if let Some(rect) = pending.cursor_rectangle {
+        debug!(?rect, "text-input-v1 cursor_rectangle -> ime");
         input_method_handle.set_text_input_rectangle::<D>(state, rect);
     }
 
