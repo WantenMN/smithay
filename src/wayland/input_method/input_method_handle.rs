@@ -244,10 +244,12 @@ where
                     ti.commit_string(Some(text.clone()));
                 });
                 // v1 bridge: use the v1 client's last serial so it accepts the event.
+                // A commit finalizes composition, so preedit is no longer showing.
                 self.text_input_handle
                     .with_active_text_input_v1(|ti, _surface, serial| {
                         debug!(serial, text = ?text, "ime commit_string -> text-input-v1");
                         ti.commit_string(serial, text.clone());
+                        self.text_input_handle.v1_note_content_forwarded(ti, Some(false));
                     });
             }
             zwp_input_method_v2::Request::SetPreeditString {
@@ -272,15 +274,19 @@ where
                         } else {
                             cursor_end
                         };
+                        let showing = !text.is_empty();
                         debug!(
                             serial,
                             text = ?text,
                             cursor,
+                            showing,
                             "ime preedit -> text-input-v1"
                         );
                         ti.preedit_cursor(cursor);
                         // Empty commit part: nothing to commit on reset.
                         ti.preedit_string(serial, text.clone(), String::new());
+                        self.text_input_handle
+                            .v1_note_content_forwarded(ti, Some(showing));
                     });
             }
             zwp_input_method_v2::Request::DeleteSurroundingText {
@@ -300,6 +306,7 @@ where
                         let index = (-before).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                         let length = before_length.saturating_add(after_length);
                         ti.delete_surrounding_text(index, length);
+                        self.text_input_handle.v1_note_content_forwarded(ti, None);
                     });
             }
             zwp_input_method_v2::Request::Commit { serial } => {
@@ -314,6 +321,17 @@ where
                     .unwrap_or(0);
 
                 self.text_input_handle.done(serial != current_serial);
+
+                // v1 bridge: a bare commit (nothing forwarded since the last
+                // commit) while a preedit is showing means the IME cancelled
+                // composition. fcitx5 never sends an empty preedit and v1 has
+                // no `done` event that would clear the client, so synthesize
+                // the clear here.
+                if let Some((ti, v1_serial)) = self.text_input_handle.v1_consume_commit() {
+                    debug!("ime bare commit -> clearing text-input-v1 preedit");
+                    ti.preedit_cursor(-1);
+                    ti.preedit_string(v1_serial, String::new(), String::new());
+                }
             }
             zwp_input_method_v2::Request::GetInputPopupSurface { id, surface } => {
                 if compositor::give_role(&surface, INPUT_POPUP_SURFACE_ROLE).is_err()

@@ -31,6 +31,12 @@ pub(crate) struct ActiveV1 {
     /// Guards against re-sending `activate` (which would reset composition)
     /// on every state update.
     pub(crate) ime_engaged: bool,
+    /// Whether any IME->client content was forwarded since the last v2 commit.
+    /// Distinguishes a bare commit (composition cancelled: fcitx5 sends no
+    /// empty preedit, only commit) from a commit accompanying content.
+    pub(crate) v1_batch_dirty: bool,
+    /// Whether the v1 client currently shows a preedit we sent.
+    pub(crate) v1_preedit_showing: bool,
 }
 
 impl TextInput {
@@ -170,18 +176,22 @@ impl TextInputHandle {
     /// Set the active v1 text-input.
     ///
     /// Re-setting the same instance (e.g. on a new commit) preserves the
-    /// `ime_engaged` flag so the input-method is not re-activated.
+    /// composition tracking flags so the input-method is not re-activated.
     pub(crate) fn set_active_v1(&self, instance: ZwpTextInputV1, surface: WlSurface, serial: u32) {
         let mut inner = self.inner.lock().unwrap();
-        let engaged = inner
+        let (engaged, dirty, showing) = inner
             .active_v1
             .as_ref()
-            .is_some_and(|a| a.instance == instance && a.ime_engaged);
+            .filter(|a| a.instance == instance)
+            .map(|a| (a.ime_engaged, a.v1_batch_dirty, a.v1_preedit_showing))
+            .unwrap_or((false, false, false));
         inner.active_v1 = Some(ActiveV1 {
             instance,
             surface,
             serial,
             ime_engaged: engaged,
+            v1_batch_dirty: dirty,
+            v1_preedit_showing: showing,
         });
     }
 
@@ -208,6 +218,45 @@ impl TextInputHandle {
             }
         }
         false
+    }
+
+    /// Record IME->client content forwarded to the active v1 text-input.
+    ///
+    /// `preedit_showing` updates preedit visibility tracking: `Some(true)` on
+    /// a non-empty preedit, `Some(false)` when composition finalized (commit
+    /// string), `None` when visibility is unchanged (e.g. delete).
+    pub(crate) fn v1_note_content_forwarded(&self, instance: &ZwpTextInputV1, preedit_showing: Option<bool>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(active) = inner.active_v1.as_mut() {
+            if active.instance == *instance {
+                active.v1_batch_dirty = true;
+                if let Some(showing) = preedit_showing {
+                    active.v1_preedit_showing = showing;
+                }
+            }
+        }
+    }
+
+    /// Consume a v2 commit for the active v1 text-input.
+    ///
+    /// Returns the instance + serial when a synthetic empty preedit must be
+    /// sent: a bare commit (no accompanying content since the last commit)
+    /// while a preedit is showing means the IME cancelled composition, but
+    /// fcitx5 never sends an empty preedit and v1 has no `done` event that
+    /// would clear the client. The caller sends the clear outside the lock.
+    pub(crate) fn v1_consume_commit(&self) -> Option<(ZwpTextInputV1, u32)> {
+        let mut inner = self.inner.lock().unwrap();
+        let active = inner.active_v1.as_mut()?;
+        if !active.instance.is_alive() {
+            return None;
+        }
+        let clear = !active.v1_batch_dirty && active.v1_preedit_showing;
+        active.v1_batch_dirty = false;
+        if clear {
+            active.v1_preedit_showing = false;
+            return Some((active.instance.clone(), active.serial));
+        }
+        None
     }
 
     /// Clear the active v1 text-input if it matches `instance`.
