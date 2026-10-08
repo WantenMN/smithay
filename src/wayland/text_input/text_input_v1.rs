@@ -105,7 +105,7 @@ where
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct V1PendingState {
     surrounding_text: Option<(String, u32, u32)>,
     content_type: Option<(
@@ -200,19 +200,26 @@ where
                 // Hint only, ignored.
             }
             zwp_text_input_v1::Request::Reset => {
-                // Client changed text outside IME flow; drop pending state.
+                // Client changed text outside IME flow; drop buffered state.
                 // The active IME (v2) has no reset event, so nothing to forward.
                 self.inner.lock().unwrap().pending = Default::default();
             }
             zwp_text_input_v1::Request::SetSurroundingText { text, cursor, anchor } => {
                 self.inner.lock().unwrap().pending.surrounding_text = Some((text, cursor, anchor));
+                // NOTE: unlike v3 (double-buffered + commit), many v1 clients
+                // (e.g. Chromium) never send `commit_state` and expect every
+                // setter to take effect immediately (Weston/exo semantics).
+                // Forward right away when already active.
+                sync_if_active::<D>(self, state, resource);
             }
             zwp_text_input_v1::Request::SetContentType { hint, purpose } => {
                 self.inner.lock().unwrap().pending.content_type = Some((hint, purpose));
+                sync_if_active::<D>(self, state, resource);
             }
             zwp_text_input_v1::Request::SetCursorRectangle { x, y, width, height } => {
                 self.inner.lock().unwrap().pending.cursor_rectangle =
                     Some(Rectangle::new((x, y).into(), (width, height).into()));
+                sync_if_active::<D>(self, state, resource);
             }
             zwp_text_input_v1::Request::SetPreferredLanguage { language } => {
                 // No v2 equivalent, store for completeness.
@@ -258,12 +265,12 @@ fn seat_handles<D: SeatHandler>(seat: &WlSeat) -> Option<(TextInputHandle, Input
 
 fn handle_v1_activate<D>(
     user_data: &TextInputV1UserData,
-    _state: &mut D,
+    state: &mut D,
     resource: &ZwpTextInputV1,
     seat: WlSeat,
     surface: WlSurface,
 ) where
-    D: SeatHandler + 'static,
+    D: SeatHandler + TextInputActivation + 'static,
 {
     // Basic sanity: surface must belong to the same client as the text-input.
     if !surface.id().same_client_as(&resource.id()) {
@@ -271,38 +278,35 @@ fn handle_v1_activate<D>(
         return;
     }
 
-    {
-        let mut inner = user_data.inner.lock().unwrap();
-        inner.seat = Some(seat.clone());
-        inner.surface = Some(surface.clone());
-    }
-
     let Some((text_input_handle, input_method_handle)) = seat_handles::<D>(&seat) else {
         return;
     };
 
-    // Emit enter on successful activation when an IME is present or the
-    // compositor itself acts as IME. Otherwise still remember the activation
-    // so a later IME bind can re-enter (see commit handling).
-    if input_method_handle.has_instance() || text_input_handle.compositor_input_method() {
-        // Only enter if the surface is the current focus or focus is not yet set?
-        // To mirror v3 (enter follows keyboard focus), only send enter when the
-        // focused client matches. If focus is elsewhere, the commit path will
-        // discard, and a later focus change + re-activate will succeed.
-        let focus_matches = text_input_handle
-            .focus()
-            .map(|focus| focus.id().same_client_as(&resource.id()))
-            .unwrap_or(true);
-        if focus_matches {
-            resource.enter(&surface);
+    // Like v3, only honor clients that hold keyboard focus (or no focus yet).
+    if let Some(focus) = text_input_handle.focus() {
+        if !focus.id().same_client_as(&resource.id()) {
+            debug!("discarding text-input-v1 activate for unfocused client");
+            return;
         }
-    } else {
-        // No IME yet: still send enter so clients proceed to commit and we
-        // remember the active surface for a later IME bind.
-        // This deviates from strict v3 enter-gating but is required because
-        // v1 instances are not tracked until activated.
-        resource.enter(&surface);
     }
+
+    let serial = {
+        let mut inner = user_data.inner.lock().unwrap();
+        inner.seat = Some(seat.clone());
+        inner.surface = Some(surface.clone());
+        inner.serial
+    };
+
+    resource.enter(&surface);
+    text_input_handle.set_active_v1(resource.clone(), surface.clone(), serial);
+    sync_v1_to_ime(
+        user_data,
+        state,
+        &text_input_handle,
+        &input_method_handle,
+        resource,
+        &surface,
+    );
 }
 
 fn handle_v1_deactivate<D>(
@@ -374,45 +378,76 @@ where
         // still allow: v1 tracks its own active surface.
     }
 
-    // Take pending state.
-    let pending = {
-        let mut inner = user_data.inner.lock().unwrap();
-        std::mem::take(&mut inner.pending)
-    };
-
-    let content_type_mapped = mapped_content_type(&pending.content_type);
-
-    let has_ime = input_method_handle.has_instance() || text_input_handle.compositor_input_method();
-
-    // Remember active even without IME so a later IME bind can re-enter.
-    let is_new_active = {
-        let inner = text_input_handle.inner.lock().unwrap();
-        inner
-            .active_v1
-            .as_ref()
-            .map(|a| a.instance != *resource)
-            .unwrap_or(true)
-    };
+    debug!(serial, "text-input-v1 commit");
 
     text_input_handle.set_active_v1(resource.clone(), surface.clone(), serial);
-
-    debug!(
-        serial,
-        has_ime,
-        is_new_active,
-        has_surrounding = pending.surrounding_text.is_some(),
-        has_content_type = pending.content_type.is_some(),
-        has_cursor_rect = pending.cursor_rectangle.is_some(),
-        "text-input-v1 commit"
+    sync_v1_to_ime(
+        user_data,
+        state,
+        &text_input_handle,
+        &input_method_handle,
+        resource,
+        &surface,
     );
+}
 
-    if !has_ime {
+/// Forward buffered v1 state to the input-method when active.
+///
+/// Called from `activate`, every setter and `commit_state`: many v1 clients
+/// (notably Chromium) never send `commit_state` and expect each request to
+/// take effect immediately, while spec-driven clients additionally commit.
+/// Re-sending unchanged state is harmless (just state sync + `done`).
+fn sync_if_active<D>(user_data: &TextInputV1UserData, state: &mut D, resource: &ZwpTextInputV1)
+where
+    D: SeatHandler + TextInputActivation + 'static,
+{
+    let (seat, surface) = {
+        let inner = user_data.inner.lock().unwrap();
+        match (inner.seat.clone(), inner.surface.clone()) {
+            (Some(seat), Some(surface)) => (seat, surface),
+            _ => return,
+        }
+    };
+
+    let Some((text_input_handle, input_method_handle)) = seat_handles::<D>(&seat) else {
+        return;
+    };
+
+    sync_v1_to_ime(
+        user_data,
+        state,
+        &text_input_handle,
+        &input_method_handle,
+        resource,
+        &surface,
+    );
+}
+
+fn sync_v1_to_ime<D>(
+    user_data: &TextInputV1UserData,
+    state: &mut D,
+    text_input_handle: &TextInputHandle,
+    input_method_handle: &InputMethodHandle,
+    resource: &ZwpTextInputV1,
+    surface: &WlSurface,
+) where
+    D: SeatHandler + TextInputActivation + 'static,
+{
+    if !text_input_handle.is_active_v1(resource) {
+        return;
+    }
+
+    if !input_method_handle.has_instance() && !text_input_handle.compositor_input_method() {
         debug!("stashing text-input-v1 state without IME running");
         return;
     }
 
-    if is_new_active {
-        input_method_handle.activate_input_method(state, &surface);
+    // Clone out of the lock: forwarding below re-enters other subsystems.
+    let pending = user_data.inner.lock().unwrap().pending.clone();
+    let content_type_mapped = mapped_content_type(&pending.content_type);
+
+    if text_input_handle.ensure_v1_engaged(resource) {
+        input_method_handle.activate_input_method(state, surface);
         state.activated(content_type_mapped.clone());
     }
 
@@ -426,7 +461,7 @@ where
         });
     }
 
-    if let Some((_, _)) = pending.content_type {
+    if pending.content_type.is_some() {
         if let Some((hint, purpose)) = content_type_mapped {
             input_method_handle.with_instance(|input_method| {
                 input_method.object.content_type(hint, purpose);

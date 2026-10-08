@@ -27,6 +27,10 @@ pub(crate) struct ActiveV1 {
     pub instance: ZwpTextInputV1,
     pub serial: u32,
     pub surface: WlSurface,
+    /// Whether the input-method has been engaged for the current activation.
+    /// Guards against re-sending `activate` (which would reset composition)
+    /// on every state update.
+    pub(crate) ime_engaged: bool,
 }
 
 impl TextInput {
@@ -164,13 +168,46 @@ impl TextInputHandle {
     }
 
     /// Set the active v1 text-input.
+    ///
+    /// Re-setting the same instance (e.g. on a new commit) preserves the
+    /// `ime_engaged` flag so the input-method is not re-activated.
     pub(crate) fn set_active_v1(&self, instance: ZwpTextInputV1, surface: WlSurface, serial: u32) {
         let mut inner = self.inner.lock().unwrap();
+        let engaged = inner
+            .active_v1
+            .as_ref()
+            .is_some_and(|a| a.instance == instance && a.ime_engaged);
         inner.active_v1 = Some(ActiveV1 {
             instance,
             surface,
             serial,
+            ime_engaged: engaged,
         });
+    }
+
+    /// Whether `instance` is the currently active v1 text-input.
+    pub(crate) fn is_active_v1(&self, instance: &ZwpTextInputV1) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .active_v1
+            .as_ref()
+            .is_some_and(|a| &a.instance == instance)
+    }
+
+    /// Mark the active v1 text-input as IME-engaged.
+    ///
+    /// Returns true when the instance just became engaged and the caller
+    /// should send `activate` to the input-method.
+    pub(crate) fn ensure_v1_engaged(&self, instance: &ZwpTextInputV1) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(active) = inner.active_v1.as_mut() {
+            if &active.instance == instance && !active.ime_engaged {
+                active.ime_engaged = true;
+                return true;
+            }
+        }
+        false
     }
 
     /// Clear the active v1 text-input if it matches `instance`.
