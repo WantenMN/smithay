@@ -207,6 +207,11 @@ where
                 text_input_handle.with_focused_text_input(|ti, surface| {
                     ti.enter(surface);
                 });
+                // v1 bridge: re-enter the active v1 instance so it recommits
+                // and the new IME receives its state.
+                text_input_handle.with_active_text_input_v1(|ti, surface, _| {
+                    ti.enter(surface);
+                });
                 let keyboard_handle = seat.get_keyboard().unwrap();
                 let instance = data_init.init(
                     input_method,

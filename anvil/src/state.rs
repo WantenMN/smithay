@@ -92,7 +92,7 @@ use smithay::{
         single_pixel_buffer::SinglePixelBufferState,
         socket::ListeningSocketSource,
         tablet_manager::TabletManagerState,
-        text_input::{TextInputActivation, TextInputManagerState},
+        text_input::{TextInputActivation, TextInputManagerState, TextInputV1ManagerState},
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
         xdg_activation::{
@@ -714,6 +714,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let fifo_manager_state = FifoManagerState::new::<Self>(&dh);
         let commit_timing_manager_state = CommitTimingManagerState::new::<Self>(&dh);
         TextInputManagerState::new::<Self>(&dh);
+        TextInputV1ManagerState::new::<Self>(&dh);
         InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
         VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
         // Expose global only if backend supports relative motion events

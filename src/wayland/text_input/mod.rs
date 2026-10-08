@@ -61,12 +61,14 @@ use crate::{
 
 pub use text_input_handle::TextInputHandle;
 pub use text_input_handle::TextInputUserData;
+pub use text_input_v1::{TextInputV1ManagerState, TextInputV1UserData};
 
 use super::input_method::InputMethodHandle;
 
 const MANAGER_VERSION: u32 = 1;
 
 mod text_input_handle;
+mod text_input_v1;
 
 /// Hooks for text input activation
 pub trait TextInputActivation {

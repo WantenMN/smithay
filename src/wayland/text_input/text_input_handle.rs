@@ -2,6 +2,7 @@ use std::mem;
 use std::sync::{Arc, Mutex};
 
 use tracing::debug;
+use wayland_protocols::wp::text_input::zv1::server::zwp_text_input_v1::ZwpTextInputV1;
 use wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::{
     self, ChangeCause, ContentHint, ContentPurpose, ZwpTextInputV3,
 };
@@ -18,6 +19,14 @@ pub(crate) struct TextInput {
     focus: Option<WlSurface>,
     active_text_input_id: Option<ObjectId>,
     compositor_input_method: bool,
+    pub(crate) active_v1: Option<ActiveV1>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActiveV1 {
+    pub instance: ZwpTextInputV1,
+    pub serial: u32,
+    pub surface: WlSurface,
 }
 
 impl TextInput {
@@ -57,6 +66,20 @@ impl TextInput {
             .find(|instance| &instance.instance.id() == active_id)
         {
             f(&text_input.instance, surface, text_input.serial);
+        }
+    }
+
+    fn with_active_v1<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&ZwpTextInputV1, &WlSurface, u32),
+    {
+        // Use the stored active surface, but ensure it is still alive.
+        // If focus exists, prefer it only when it matches the stored surface's client
+        // to avoid sending events to a dead or defocused client.
+        if let Some(active) = self.active_v1.as_ref() {
+            if active.surface.is_alive() && active.instance.is_alive() {
+                f(&active.instance, &active.surface, active.serial);
+            }
         }
     }
 }
@@ -112,6 +135,10 @@ impl TextInputHandle {
         inner.with_focused_client_all_text_inputs(|text_input, focus, _| {
             text_input.leave(focus);
         });
+        // v1: send leave to the active v1 instance and clear it.
+        if let Some(active) = inner.active_v1.take() {
+            active.instance.leave();
+        }
     }
 
     /// Send `enter` on the text-input instance for the currently focused
@@ -123,6 +150,45 @@ impl TextInputHandle {
         inner.with_focused_client_all_text_inputs(|text_input, focus, _| {
             text_input.enter(focus);
         });
+        // v1: if there is an active v1 instance for the focused client, send enter.
+        // NOTE: v1 `enter` is normally sent as a response to `activate`, but we also
+        // re-send it here when a real IME appears (mirrors v3 behavior where `enter`
+        // is sent once an IME is bound) and when compositor acts as IME.
+        if let Some(focus) = inner.focus.as_ref().filter(|s| s.is_alive()).cloned() {
+            if let Some(active) = inner.active_v1.as_ref() {
+                if active.instance.id().same_client_as(&focus.id()) && active.instance.is_alive() {
+                    active.instance.enter(&focus);
+                }
+            }
+        }
+    }
+
+    /// Set the active v1 text-input.
+    pub(crate) fn set_active_v1(&self, instance: ZwpTextInputV1, surface: WlSurface, serial: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.active_v1 = Some(ActiveV1 {
+            instance,
+            surface,
+            serial,
+        });
+    }
+
+    /// Clear the active v1 text-input if it matches `instance`.
+    /// Returns true if an active instance was cleared.
+    pub(crate) fn clear_active_v1(&self, instance: &ZwpTextInputV1) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(active) = inner.active_v1.as_ref() {
+            if &active.instance == instance {
+                inner.active_v1 = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether there is an active v1 text-input.
+    pub fn has_active_v1(&self) -> bool {
+        self.inner.lock().unwrap().active_v1.is_some()
     }
 
     /// Have the compositor act as the input method for this seat.
@@ -189,6 +255,17 @@ impl TextInputHandle {
         });
     }
 
+    /// Access the active v1 text-input instance, if any.
+    pub fn with_active_text_input_v1<F>(&self, mut f: F)
+    where
+        F: FnMut(&ZwpTextInputV1, &WlSurface, u32),
+    {
+        let mut inner = self.inner.lock().unwrap();
+        inner.with_active_v1(|ti, surface, serial| {
+            f(ti, surface, serial);
+        });
+    }
+
     /// Call the callback with the serial of the active text_input or with the passed
     /// `default` one when empty.
     pub(crate) fn active_text_input_serial_or_default<F>(&self, default: u32, mut callback: F)
@@ -201,6 +278,13 @@ impl TextInputHandle {
             should_default = false;
             callback(serial);
         });
+        if should_default {
+            // Fall back to the v1 serial when no v3 text-input is active.
+            inner.with_active_v1(|_, _, serial| {
+                should_default = false;
+                callback(serial);
+            });
+        }
         if should_default {
             callback(default)
         }

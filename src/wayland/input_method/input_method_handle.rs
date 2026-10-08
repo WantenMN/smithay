@@ -243,6 +243,11 @@ where
                 self.text_input_handle.with_active_text_input(|ti, _surface| {
                     ti.commit_string(Some(text.clone()));
                 });
+                // v1 bridge: use the v1 client's last serial so it accepts the event.
+                self.text_input_handle
+                    .with_active_text_input_v1(|ti, _surface, serial| {
+                        ti.commit_string(serial, text.clone());
+                    });
             }
             zwp_input_method_v2::Request::SetPreeditString {
                 text,
@@ -252,6 +257,24 @@ where
                 self.text_input_handle.with_active_text_input(|ti, _surface| {
                     ti.preedit_string(Some(text.clone()), cursor_begin, cursor_end);
                 });
+                // v1 bridge: preedit_string + preedit_cursor.
+                // v1 has a single cursor index (negative hides); v2 has a
+                // begin/end pair. Map hidden when both are -1, otherwise use
+                // begin (clamped to >= 0 for the string event, cursor may be -1).
+                // Spec requires cursor/styling before the string event.
+                self.text_input_handle
+                    .with_active_text_input_v1(|ti, _surface, serial| {
+                        let cursor = if cursor_begin == -1 && cursor_end == -1 {
+                            -1
+                        } else if cursor_begin >= 0 {
+                            cursor_begin
+                        } else {
+                            cursor_end
+                        };
+                        ti.preedit_cursor(cursor);
+                        // Empty commit part: nothing to commit on reset.
+                        ti.preedit_string(serial, text.clone(), String::new());
+                    });
             }
             zwp_input_method_v2::Request::DeleteSurroundingText {
                 before_length,
@@ -260,6 +283,17 @@ where
                 self.text_input_handle.with_active_text_input(|ti, _surface| {
                     ti.delete_surrounding_text(before_length, after_length);
                 });
+                // v1 bridge: index relative to cursor, length total.
+                // v2: before/after bytes excluding selection.
+                // v1: index (relative) + length.
+                self.text_input_handle
+                    .with_active_text_input_v1(|ti, _surface, _serial| {
+                        let before = before_length as i64;
+                        // Clamp to i32 range.
+                        let index = (-before).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                        let length = before_length.saturating_add(after_length);
+                        ti.delete_surrounding_text(index, length);
+                    });
             }
             zwp_input_method_v2::Request::Commit { serial } => {
                 let current_serial = self
